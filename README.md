@@ -257,4 +257,4 @@ Those can be layered on after the core mutable zero-copy path is stable.
 
 ## License
 
-Apache-2.0.
+MIT License
