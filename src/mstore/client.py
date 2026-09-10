@@ -1,15 +1,54 @@
 from __future__ import annotations
 
+import hashlib
 import mmap
 import os
-import socket
+import threading
+from collections import OrderedDict
 from typing import Any, Iterable
 
 import numpy as np
 
 from .errors import ERROR_TYPES, MStoreError, ProtocolError
-from .protocol import recv_frame_with_optional_fd, send_frame
-from .server import default_endpoint, parse_endpoint
+from .transport import ControlConnection, connect_control, default_endpoint
+
+
+class _MappingState:
+    """Own one OS mapping; cache ownership and SharedObject leases are independent."""
+
+    def __init__(self, mapping: mmap.mmap, info: dict[str, Any]) -> None:
+        self.mapping = mapping
+        self.info = info
+        self._leases = 0
+        self._cached = False
+        self._lock = threading.Lock()
+
+    def acquire(self) -> None:
+        with self._lock:
+            if self.mapping.closed:
+                raise RuntimeError("shared-memory mapping is closed")
+            self._leases += 1
+
+    def release(self) -> None:
+        with self._lock:
+            if self._leases > 0:
+                self._leases -= 1
+            self._maybe_close_locked()
+
+    def set_cached(self, cached: bool) -> None:
+        with self._lock:
+            self._cached = cached
+            self._maybe_close_locked()
+
+    def _maybe_close_locked(self) -> None:
+        if self._cached or self._leases != 0 or self.mapping.closed:
+            return
+        try:
+            self.mapping.close()
+        except BufferError:
+            # Exported NumPy/memoryview objects still own the mmap buffer. Leaving the
+            # mmap alive is safe; Python will release it when those exports disappear.
+            pass
 
 
 class SharedObject:
@@ -19,14 +58,15 @@ class SharedObject:
         info: dict[str, Any],
         token: str,
         mode: str,
-        mapping: mmap.mmap,
+        state: _MappingState,
     ) -> None:
         self._client = client
         self._info = info
         self.token = token
         self.mode = mode
-        self._mapping = mapping
-        self._close_requested = False
+        self._state = state
+        self._released = False
+        self._state.acquire()
 
     @property
     def object_id(self) -> str:
@@ -56,7 +96,12 @@ class SharedObject:
 
     @property
     def closed(self) -> bool:
-        return self._mapping.closed
+        return self._released or self._state.mapping.closed
+
+    def _require_open(self) -> mmap.mmap:
+        if self._released or self._state.mapping.closed:
+            raise ValueError("shared object is closed")
+        return self._state.mapping
 
     def numpy(self) -> np.ndarray:
         if self.shape is None or self.dtype is None:
@@ -64,7 +109,7 @@ class SharedObject:
         arr = np.ndarray(
             self.shape,
             dtype=self.dtype,
-            buffer=self._mapping,
+            buffer=self._require_open(),
             order=self._info.get("order", "C"),
         )
         if self.mode == "read":
@@ -72,7 +117,7 @@ class SharedObject:
         return arr
 
     def buffer(self) -> memoryview:
-        view = memoryview(self._mapping)
+        view = memoryview(self._require_open())
         if self.mode == "read" and not view.readonly:
             view = view.toreadonly()
         return view
@@ -100,15 +145,10 @@ class SharedObject:
         self._client.delete(self.object_id, self.token)
 
     def close(self) -> None:
-        if self._mapping.closed:
+        if self._released:
             return
-        self._close_requested = True
-        try:
-            self._mapping.close()
-        except BufferError:
-            # NumPy/memoryview exports may still point at the mapping. Keeping the mmap
-            # alive is safer than invalidating live arrays; it will close once views die.
-            pass
+        self._released = True
+        self._state.release()
 
     def __enter__(self) -> "SharedObject":
         return self
@@ -124,27 +164,77 @@ class SharedObject:
 
 
 class Client:
-    def __init__(self, endpoint: str | None = None, *, timeout: float = 10.0) -> None:
+    """Persistent mstore control client with optional LRU mapping cache.
+
+    ``open(..., cache=True)`` keeps the OS mapping attached after the returned
+    SharedObject is closed, allowing later opens with the same object/token/mode to
+    avoid both control IPC and mmap attachment. This intentionally extends an already
+    opened capability lease; token revocation/expiry only prevents *future* mappings.
+    Call ``clear_cache()`` when that lease should be dropped.
+    """
+
+    def __init__(
+        self,
+        endpoint: str | None = None,
+        *,
+        timeout: float = 10.0,
+        cache_size: int = 64,
+    ) -> None:
+        if cache_size < 0:
+            raise ValueError("cache_size must be >= 0")
         self.endpoint = endpoint or default_endpoint()
         self.timeout = timeout
+        self.cache_size = cache_size
+        self._conn: ControlConnection | None = None
+        self._request_lock = threading.RLock()
+        self._cache_lock = threading.RLock()
+        self._cache: OrderedDict[tuple[str, bytes, str], _MappingState] = OrderedDict()
+        self._pid = os.getpid()
+        self._closed = False
 
-    def _connect(self) -> socket.socket:
-        kind, address = parse_endpoint(self.endpoint)
-        if kind == "unix":
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        else:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        sock.settimeout(self.timeout)
-        sock.connect(address)
-        return sock
+    def _after_fork_if_needed(self) -> None:
+        pid = os.getpid()
+        if pid == self._pid:
+            return
+        # Never share a request/response stream across fork boundaries. Closing the
+        # child's inherited descriptor does not affect the parent's descriptor.
+        inherited = self._conn
+        self._conn = None
+        if inherited is not None:
+            inherited.close()
+        for state in self._cache.values():
+            state.set_cached(False)
+        self._request_lock = threading.RLock()
+        self._cache_lock = threading.RLock()
+        self._cache = OrderedDict()
+        self._pid = pid
+        self._closed = False
+
+    def _ensure_connection(self) -> ControlConnection:
+        self._after_fork_if_needed()
+        if self._closed:
+            raise RuntimeError("client is closed")
+        if self._conn is None:
+            self._conn = connect_control(self.endpoint, self.timeout)
+        return self._conn
+
+    def _drop_connection(self) -> None:
+        conn, self._conn = self._conn, None
+        if conn is not None:
+            conn.close()
 
     def _request(self, op: str, **args: Any) -> tuple[dict[str, Any], int | None]:
-        sock = self._connect()
-        try:
-            send_frame(sock, {"op": op, "args": args})
-            response, fd = recv_frame_with_optional_fd(sock)
-        finally:
-            sock.close()
+        # A single persistent connection is a strict request/response stream. Serialize
+        # access so one Client can safely be shared by multiple application threads.
+        with self._request_lock:
+            conn = self._ensure_connection()
+            try:
+                conn.send({"op": op, "args": args})
+                response, fd = conn.recv()
+            except (EOFError, OSError, ConnectionError, ProtocolError) as exc:
+                self._drop_connection()
+                raise ProtocolError(f"mstore control connection failed during {op!r}") from exc
+
         if not response.get("ok"):
             if fd is not None:
                 os.close(fd)
@@ -182,6 +272,42 @@ class Client:
         if fd is not None:
             os.close(fd)
         raise ProtocolError(f"unsupported mapping backend: {backend!r}")
+
+    def _cache_get(self, key: tuple[str, bytes, str]) -> _MappingState | None:
+        with self._cache_lock:
+            state = self._cache.get(key)
+            if state is None:
+                return None
+            if state.mapping.closed:
+                self._cache.pop(key, None)
+                state.set_cached(False)
+                return None
+            self._cache.move_to_end(key)
+            return state
+
+    def _cache_put(self, key: tuple[str, bytes, str], state: _MappingState) -> None:
+        if self.cache_size == 0:
+            return
+        with self._cache_lock:
+            old = self._cache.pop(key, None)
+            if old is not None and old is not state:
+                old.set_cached(False)
+            state.set_cached(True)
+            self._cache[key] = state
+            while len(self._cache) > self.cache_size:
+                _, evicted = self._cache.popitem(last=False)
+                evicted.set_cached(False)
+
+    def clear_cache(self, object_id: str | None = None) -> None:
+        with self._cache_lock:
+            if object_id is None:
+                states = list(self._cache.values())
+                self._cache.clear()
+            else:
+                keys = [key for key in self._cache if key[0] == object_id]
+                states = [self._cache.pop(key) for key in keys]
+            for state in states:
+                state.set_cached(False)
 
     def ping(self) -> dict[str, Any]:
         result, fd = self._request("ping")
@@ -224,18 +350,34 @@ class Client:
             order=order,
             metadata=metadata or {},
         )
-        token = result["token"]
+        token = str(result["token"])
         mapping = self._open_mapping(result["mapping"], fd, "write")
-        return SharedObject(self, result["object"], token, "write", mapping)
+        state = _MappingState(mapping, result["object"])
+        return SharedObject(self, result["object"], token, "write", state)
 
-    def open(self, object_id: str, token: str, *, mode: str = "read") -> SharedObject:
+    def open(
+        self,
+        object_id: str,
+        token: str,
+        *,
+        mode: str = "read",
+        cache: bool = False,
+    ) -> SharedObject:
         if mode not in {"read", "write"}:
             raise ValueError("mode must be 'read' or 'write'")
-        result, fd = self._request(
-            "open", object_id=object_id, token=token, mode=mode
-        )
+        token_key = hashlib.sha256(token.encode("utf-8")).digest()
+        key = (object_id, token_key, mode)
+        if cache:
+            state = self._cache_get(key)
+            if state is not None:
+                return SharedObject(self, state.info, token, mode, state)
+
+        result, fd = self._request("open", object_id=object_id, token=token, mode=mode)
         mapping = self._open_mapping(result["mapping"], fd, mode)
-        return SharedObject(self, result["object"], token, mode, mapping)
+        state = _MappingState(mapping, result["object"])
+        if cache:
+            self._cache_put(key, state)
+        return SharedObject(self, result["object"], token, mode, state)
 
     def issue_token(
         self,
@@ -282,7 +424,33 @@ class Client:
             os.close(fd)
         if not result.get("deleted"):
             raise ProtocolError("server did not confirm object deletion")
+        self.clear_cache(object_id)
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self.clear_cache()
+        with self._request_lock:
+            self._drop_connection()
+            self._closed = True
+
+    def __enter__(self) -> "Client":
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        self.close()
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
 
-def connect(endpoint: str | None = None, *, timeout: float = 10.0) -> Client:
-    return Client(endpoint, timeout=timeout)
+def connect(
+    endpoint: str | None = None,
+    *,
+    timeout: float = 10.0,
+    cache_size: int = 64,
+) -> Client:
+    return Client(endpoint, timeout=timeout, cache_size=cache_size)

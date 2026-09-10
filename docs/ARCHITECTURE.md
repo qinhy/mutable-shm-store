@@ -2,19 +2,25 @@
 
 ## Invariants
 
-1. Bulk data never travels through the control socket.
+1. Bulk data never travels through the control channel.
 2. The daemon owns backing-memory lifetime.
 3. Tokens are capabilities, not ownership records.
-4. Multiple writers are legal; synchronization is opt-in and outside v0.1.
+4. Multiple writers are legal; synchronization is opt-in and outside v0.2.
 5. Revocation affects future opens, not mappings already established.
 6. NumPy is an adapter over shared bytes, not the storage layer.
 
 ## Control plane
 
-Each client request uses one short-lived local connection and one length-prefixed JSON message. This keeps
-failure recovery simple and makes the protocol easy to reimplement in C/C++ later.
+Each client lazily establishes one local control connection and reuses it for strict, sequential
+request/response exchanges. Client-side locking makes a session safe to share across application threads.
+Connections are not shared across a process fork: the child drops the inherited connection and opens its
+own session on demand.
 
-Operations in v0.1:
+Socket transports carry length-prefixed JSON frames. Windows named pipes preserve message boundaries but
+carry the same framed JSON payload, keeping protocol validation and future non-Python implementations
+consistent. A malformed stream is answered once when possible and then closed rather than reused.
+
+Operations in v0.2:
 
 - `ping`
 - `create`
@@ -24,7 +30,7 @@ Operations in v0.1:
 - `revoke`
 - `delete`
 
-The wire protocol is deliberately private in v0.1; compatibility is promised at the Python API level only.
+The wire protocol is deliberately private in v0.2; compatibility is promised at the Python API level only.
 
 ## Data plane: Linux
 
@@ -39,8 +45,22 @@ write opens it duplicates the RW descriptor. The client maps with `mmap.ACCESS_R
 The daemon creates a named anonymous mapping with `mmap(..., tagname=...)` and holds it open. After token
 validation, clients receive the random tag name and map it with `ACCESS_READ` or `ACCESS_WRITE`.
 
-The control plane uses loopback TCP because Python's SCM_RIGHTS helpers are Unix-only. Named pipes and
-Windows ACL hardening are future work.
+The control plane uses a Windows named pipe by default. Loopback TCP is retained as an explicit fallback;
+the mapping name, rather than an OS descriptor, is sufficient to attach the data plane on Windows. Custom
+Windows ACL hardening remains future work.
+
+## Client mapping cache
+
+`open(..., cache=True)` stores the attached mapping in a bounded LRU cache keyed by object ID, SHA-256
+token digest, and access mode. A `SharedObject` lease and cache ownership are tracked independently:
+
+- closing a `SharedObject` releases its lease but leaves a cached mapping attached;
+- eviction or `clear_cache()` closes an idle mapping;
+- a live `SharedObject` keeps an evicted mapping valid until its lease ends;
+- `Client.close()` clears the cache and closes the persistent control connection.
+
+Reusing a cache entry performs no control request. It therefore has the same revocation and deletion
+semantics as any other already-established mapping.
 
 ## Token model
 

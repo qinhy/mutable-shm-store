@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+from uuid import uuid4
 
 import pytest
 
@@ -11,18 +12,17 @@ from mstore.server import MStoreServer
 @pytest.fixture
 def server(tmp_path: Path):
     if os.name == "nt":
-        endpoint = "tcp://127.0.0.1:0"
+        endpoint = f"pipe://mstore-test-{uuid4().hex}"
     else:
         endpoint = f"unix://{tmp_path / 'mstore.sock'}"
     srv = MStoreServer(endpoint)
     thread = srv.start_in_thread()
-    # For TCP port 0, endpoint is updated after bind.
+    # start_in_thread waits until either listener flavor has been published.
     for _ in range(200):
         try:
-            kind = "tcp" if srv.endpoint.startswith("tcp://") else "unix"
-            if kind == "tcp" and not srv.endpoint.endswith(":0"):
+            if srv.endpoint.startswith("pipe://"):
                 break
-            if kind == "unix" and Path(srv.endpoint[len("unix://"):]).exists():
+            if Path(srv.endpoint[len("unix://") :]).exists():
                 break
         except OSError:
             pass

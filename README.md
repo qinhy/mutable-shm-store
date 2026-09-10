@@ -3,10 +3,10 @@
 A small, token-capability **mutable shared-memory object server** for large NumPy arrays and byte buffers.
 It is designed for pipelines where copying immutable multi-GB objects between stages is the bottleneck.
 
-**v0.1 targets Linux and Windows.** Linux uses anonymous `memfd` + Unix-domain-socket FD passing. Windows
-uses named kernel `mmap` mappings + a loopback control socket. The public Python API is the same.
+**v0.2 targets Linux and Windows.** Linux uses anonymous `memfd` + Unix-domain-socket FD passing. Windows
+uses named kernel `mmap` mappings + a named-pipe control connection. The public Python API is the same.
 
-> Status: alpha / reference-quality v0.1. The core zero-copy path, token model, tests, packaging, examples,
+> Status: alpha / reference-quality v0.2. The core zero-copy path, token model, tests, packaging, examples,
 > and CI are included. Read `SECURITY.md` before production use.
 
 ## Why
@@ -46,6 +46,8 @@ The control plane sends object metadata and capabilities. The bulk data never pa
 - Server-owned object lifetime; client crashes do not automatically destroy objects
 - Linux: `memfd_create()` + `SCM_RIGHTS`
 - Windows: named `mmap` kernel mappings
+- Persistent, thread-safe control connections
+- Optional LRU cache for repeated mapping opens
 - No mandatory ownership-transfer protocol and no mandatory writer lock
 
 ## Install
@@ -74,7 +76,7 @@ Windows:
 
 ```powershell
 mstore-server
-# default: tcp://127.0.0.1:65432
+# default: pipe://mstore-<username>
 ```
 
 Choose an endpoint explicitly:
@@ -84,8 +86,11 @@ mstore-server --endpoint unix:///tmp/my-mstore.sock
 ```
 
 ```powershell
-mstore-server --endpoint tcp://127.0.0.1:65432
+mstore-server --endpoint pipe://my-mstore
 ```
+
+Windows also supports `tcp://127.0.0.1:65432` as a fallback. Keep TCP endpoints on loopback; Linux must
+use `unix://` because file descriptors cannot be passed over TCP.
 
 ## Python API
 
@@ -126,6 +131,23 @@ arr = obj.numpy()
 assert not arr.flags.writeable
 ```
 
+Repeated opens can retain and reuse an attached mapping:
+
+```python
+with mstore.connect(cache_size=64) as store:
+    obj = store.open(OBJECT_ID, READ_TOKEN, mode="read", cache=True)
+    consume(obj.numpy())
+    obj.close()
+
+    # Reuses the same mapping without another control request or mmap attachment.
+    again = store.open(OBJECT_ID, READ_TOKEN, mode="read", cache=True)
+```
+
+Caching is opt-in per `open()`. Cache keys include the object ID, a hash of the token, and the access mode.
+Use `store.clear_cache()` (or `store.clear_cache(object_id)`) to detach idle cached mappings. Closing the
+client clears its cache and control connection; mappings still leased by live `SharedObject` instances stay
+valid until those objects close.
+
 Raw bytes:
 
 ```python
@@ -145,8 +167,9 @@ Revocation blocks future opens:
 image.revoke(token)
 ```
 
-Already-established mappings intentionally remain usable after revocation. This is a property of local
-shared memory, not a bug; see `SECURITY.md`.
+Already-established mappings intentionally remain usable after revocation. Cached mappings count as
+already established, so a cached open can continue to succeed until the cache entry is cleared or evicted.
+This is a property of local shared memory, not a bug; see `SECURITY.md`.
 
 ## Token semantics
 
@@ -179,7 +202,7 @@ this token model without changing the data plane.
              +-----------------+-----------------+
              |                                   |
           Linux                              Windows
-   Unix socket + FD pass               loopback TCP + name
+   Unix socket + FD pass                named pipe + name
              |                                   |
           memfd                               named mmap
              +-----------------+-----------------+
@@ -197,6 +220,13 @@ an RW descriptor.
 
 The daemon owns a named kernel `mmap` mapping. After token validation the client receives its random mapping
 name and opens it with `ACCESS_READ` or `ACCESS_WRITE`. The daemon's open handle keeps the mapping alive.
+The control connection uses a Windows named pipe by default; loopback TCP remains available as a fallback.
+
+### Control sessions
+
+A `Client` lazily opens one control connection and reuses it for sequential request/response exchanges.
+Calls are serialized internally, so the same client can be used from multiple threads. If a process forks,
+the child drops the inherited session and mapping cache before its next request.
 
 ## Object lifecycle
 
@@ -233,7 +263,7 @@ The GitHub Actions matrix runs on Ubuntu and Windows using Python 3.10 and 3.13.
 
 ## Current scope / non-goals
 
-v0.1 intentionally does not provide:
+v0.2 intentionally does not provide:
 
 - multi-host/network object access
 - persistence across daemon restarts

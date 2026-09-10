@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+import os
 import time
 
 import numpy as np
@@ -7,6 +9,7 @@ import pytest
 
 import mstore
 from mstore.errors import ObjectNotFound, PermissionDenied, TokenExpired, TokenRevoked
+from mstore.server import MStoreServer
 
 
 def test_mutable_zero_copy_views(server):
@@ -116,3 +119,101 @@ np.add(arr, 4, out=arr, casting="unsafe")
         timeout=10,
     )
     assert np.all(owner.numpy() == 7)
+
+
+def test_client_reuses_one_control_connection_across_requests(server):
+    store = mstore.connect(server.endpoint)
+
+    assert store.ping()["pong"] is True
+    connection = store._conn
+    assert connection is not None
+
+    assert store.ping()["pong"] is True
+    assert store._conn is connection
+
+
+def test_client_serializes_persistent_connection_across_threads(server):
+    store = mstore.connect(server.endpoint)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(lambda _: store.ping(), range(32)))
+
+    assert all(result["pong"] is True for result in results)
+    assert len(server._connections) == 1
+
+
+def test_cached_open_reuses_mapping_without_control_request(server):
+    store = mstore.connect(server.endpoint)
+    owner = store.create(shape=(8,), dtype=np.uint8)
+    read_token = owner.issue("read")
+
+    first = store.open(owner.object_id, read_token, cache=True)
+    state = first._state
+    first.close()
+    second = store.open(owner.object_id, read_token, cache=True)
+
+    assert second._state is state
+    assert second.numpy().shape == (8,)
+
+
+def test_cached_mapping_is_an_established_capability_lease(server):
+    store = mstore.connect(server.endpoint)
+    owner = store.create(shape=(8,), dtype=np.uint8)
+    read_token = owner.issue("read")
+
+    cached = store.open(owner.object_id, read_token, cache=True)
+    state = cached._state
+    cached.close()
+    owner.revoke(read_token)
+
+    reused = store.open(owner.object_id, read_token, cache=True)
+    assert reused._state is state
+    reused.close()
+
+    store.clear_cache(owner.object_id)
+    assert state.mapping.closed
+    with pytest.raises(TokenRevoked):
+        store.open(owner.object_id, read_token, cache=True)
+
+
+def test_cache_eviction_waits_for_live_shared_object(server):
+    store = mstore.connect(server.endpoint, cache_size=1)
+    first_owner = store.create(size=8)
+    second_owner = store.create(size=8)
+    first_token = first_owner.issue("read")
+    second_token = second_owner.issue("read")
+
+    first = store.open(first_owner.object_id, first_token, cache=True)
+    first_state = first._state
+    second = store.open(second_owner.object_id, second_token, cache=True)
+
+    assert not first_state.mapping.closed
+    first.close()
+    assert first_state.mapping.closed
+
+    second_state = second._state
+    second.close()
+    store.close()
+    assert second_state.mapping.closed
+
+
+def test_client_context_manager_closes_control_session(server):
+    with mstore.connect(server.endpoint) as store:
+        assert store.ping()["pong"] is True
+        assert store._conn is not None
+
+    assert store._conn is None
+    with pytest.raises(RuntimeError, match="client is closed"):
+        store.ping()
+
+
+@pytest.mark.skipif(os.name != "nt", reason="Windows-only TCP fallback")
+def test_windows_tcp_control_fallback():
+    srv = MStoreServer("tcp://127.0.0.1:0")
+    thread = srv.start_in_thread()
+    try:
+        with mstore.connect(srv.endpoint) as store:
+            assert store.ping()["pong"] is True
+    finally:
+        srv.shutdown()
+        thread.join(timeout=3)

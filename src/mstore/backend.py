@@ -11,7 +11,6 @@ class Region(Protocol):
     size: int
 
     def client_mapping(self, mode: str) -> tuple[dict[str, Any], int | None]: ...
-
     def close(self) -> None: ...
 
 
@@ -36,8 +35,8 @@ class LinuxMemfdRegion:
 
     def client_mapping(self, mode: str) -> tuple[dict[str, Any], int]:
         if mode == "read":
-            # Re-open through procfs to obtain a genuinely O_RDONLY descriptor.
-            # A dup() would retain O_RDWR and a hostile client could remap it writable.
+            # dup() would preserve O_RDWR. Reopening through procfs produces a real
+            # O_RDONLY descriptor, so the receiving process cannot remap it writable.
             path = f"/proc/self/fd/{self.fd}"
             fd = os.open(path, os.O_RDONLY | getattr(os, "O_CLOEXEC", 0))
         elif mode == "write":
@@ -60,8 +59,8 @@ class WindowsNamedRegion:
 
     @classmethod
     def create(cls, size: int, object_id: str) -> "WindowsNamedRegion":
-        # Keep a daemon-owned handle open so the named mapping survives client exits.
-        # A random suffix avoids collisions if stale clients keep an old mapping alive.
+        # The daemon keeps this mapping open so its named kernel object survives
+        # producer/client exits. Random suffixes prevent collisions with stale views.
         name = f"mstore-{object_id}-{secrets.token_hex(8)}"
         mapping = mmap.mmap(-1, size, tagname=name, access=mmap.ACCESS_WRITE)
         return cls(mapping=mapping, size=size, name=name)
@@ -85,4 +84,4 @@ def create_region(size: int, object_id: str) -> Region:
         return WindowsNamedRegion.create(size, object_id)
     if os.name == "posix" and hasattr(os, "memfd_create"):
         return LinuxMemfdRegion.create(size, object_id)
-    raise RuntimeError("mstore v0.1 supports Linux (memfd) and Windows (named mmap)")
+    raise RuntimeError("mstore supports Linux (memfd) and Windows (named mmap)")
