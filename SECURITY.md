@@ -5,6 +5,8 @@ mstore v0.2 is a **same-host, same-trust-domain** shared-memory service.
 - Tokens are 256-bit opaque capability secrets; the daemon stores SHA-256 hashes, not raw tokens.
 - Linux uses anonymous `memfd` objects. Clients cannot attach by name; the daemon must pass an FD.
 - Linux read opens receive a descriptor reopened `O_RDONLY` and are mapped `ACCESS_READ`.
+- macOS uses POSIX shared memory, unlinked immediately after opening separate writable and
+  `O_RDONLY` descriptors. Clients receive descriptors over Unix sockets after token validation.
 - Windows uses named kernel mappings because Unix FD passing is unavailable. The random mapping name is
   disclosed only after token validation, but v0.2 does not install custom Windows ACLs. A process in the
   same login/session that learns the mapping name may bypass the mstore control plane.

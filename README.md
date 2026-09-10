@@ -3,8 +3,9 @@
 A small, token-capability **mutable shared-memory object server** for large NumPy arrays and byte buffers.
 It is designed for pipelines where copying immutable multi-GB objects between stages is the bottleneck.
 
-**v0.2 targets Linux and Windows.** Linux uses anonymous `memfd` + Unix-domain-socket FD passing. Windows
-uses named kernel `mmap` mappings + a named-pipe control connection. The public Python API is the same.
+**v0.2 targets Linux, macOS, and Windows.** Linux uses anonymous `memfd` + Unix-domain-socket FD passing. Windows
+uses named kernel `mmap` mappings + a named-pipe control connection. macOS uses POSIX shared memory
+and Unix-domain-socket FD passing. The public Python API is the same.
 
 > Status: alpha / reference-quality v0.2. The core zero-copy path, token model, tests, packaging, examples,
 > and CI are included. Read `SECURITY.md` before production use.
@@ -45,6 +46,7 @@ The control plane sends object metadata and capabilities. The bulk data never pa
 - Read-only client mappings for read tokens
 - Server-owned object lifetime; client crashes do not automatically destroy objects
 - Linux: `memfd_create()` + `SCM_RIGHTS`
+- macOS: `shm_open()` + `SCM_RIGHTS`
 - Windows: named `mmap` kernel mappings
 - Persistent, thread-safe control connections
 - Optional LRU cache for repeated mapping opens
@@ -65,7 +67,7 @@ pytest -q
 
 ## Start the server
 
-Linux:
+Linux and macOS:
 
 ```bash
 mstore-server
@@ -89,7 +91,7 @@ mstore-server --endpoint unix:///tmp/my-mstore.sock
 mstore-server --endpoint pipe://my-mstore
 ```
 
-Windows also supports `tcp://127.0.0.1:65432` as a fallback. Keep TCP endpoints on loopback; Linux must
+Windows also supports `tcp://127.0.0.1:65432` as a fallback. Keep TCP endpoints on loopback; Linux and macOS must
 use `unix://` because file descriptors cannot be passed over TCP.
 
 ## Python API
@@ -216,6 +218,13 @@ The daemon creates an anonymous `memfd`, keeps its descriptor open, and sends a 
 authorized clients via `SCM_RIGHTS`. Read clients receive an `O_RDONLY` descriptor; write clients receive
 an RW descriptor.
 
+### macOS
+
+The daemon creates POSIX shared memory with `shm_open()`, opens separate read-only and writable
+descriptors, then immediately unlinks the name. Authorized clients receive a descriptor via
+`SCM_RIGHTS`; existing mappings survive deletion and are reclaimed when the last reference closes.
+No shared-memory name is exposed to clients. Use a short Unix socket path such as `/tmp/mstore.sock`.
+
 ### Windows
 
 The daemon owns a named kernel `mmap` mapping. After token validation the client receives its random mapping
@@ -259,7 +268,7 @@ For image/tensor pipelines, measure algorithmic temporary allocations separately
 pytest -q
 ```
 
-The GitHub Actions matrix runs on Ubuntu and Windows using Python 3.10 and 3.13.
+The GitHub Actions matrix runs on Ubuntu, macOS, and Windows using Python 3.10 and 3.13.
 
 ## Current scope / non-goals
 

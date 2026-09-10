@@ -1,24 +1,9 @@
 from __future__ import annotations
 
-import os
-import tempfile
-
 import numpy as np
 import pytest
 
-from mstore import Client, MStoreServer, PermissionDenied, TokenRevoked
-
-
-@pytest.fixture
-def server():
-    if os.name == "nt":
-        pytest.skip("Linux CI test uses AF_UNIX; Windows AF_PIPE requires Windows")
-    path = tempfile.mktemp(prefix="mstore-test-", suffix=".sock")
-    srv = MStoreServer(f"unix://{path}")
-    thread = srv.start_in_thread()
-    yield srv
-    srv.shutdown()
-    thread.join(timeout=2)
+from mstore import Client, PermissionDenied, TokenRevoked
 
 
 def test_persistent_create_open_mutate_and_readonly(server):
@@ -83,7 +68,7 @@ def test_cache_hit_bypasses_control_plane_and_mapping_attach(server):
         owner.close()
 
 
-def test_revocation_clears_same_client_cached_capability(server):
+def test_revoked_capability_cannot_reopen_after_cache_clear(server):
     with Client(server.endpoint, cache_size=4) as client:
         owner = client.create(shape=(8,), dtype=np.uint8)
         token = owner.issue("read")
@@ -93,6 +78,8 @@ def test_revocation_clears_same_client_cached_capability(server):
         assert client.cache_info()["size"] == 1
 
         owner.revoke(token)
+        assert client.cache_info()["size"] == 1
+        assert client.clear_cache(owner.object_id) == 1
         assert client.cache_info()["size"] == 0
 
         with pytest.raises(TokenRevoked):

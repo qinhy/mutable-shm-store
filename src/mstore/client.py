@@ -271,9 +271,9 @@ class Client:
         backend = mapping.get("backend")
         size = int(mapping["size"])
         access = mmap.ACCESS_READ if mode == "read" else mmap.ACCESS_WRITE
-        if backend == "memfd":
+        if backend in {"memfd", "posix_shm"}:
             if fd is None:
-                raise ProtocolError("memfd response did not include a file descriptor")
+                raise ProtocolError(f"{backend} response did not include a file descriptor")
             try:
                 return mmap.mmap(fd, size, access=access)
             finally:

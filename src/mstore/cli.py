@@ -12,7 +12,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--endpoint",
         default=default_endpoint(),
         help=(
-            "pipe://NAME on Windows, unix:///path/to.sock on Linux, or "
+            "pipe://NAME on Windows, unix:///path/to.sock on Linux or macOS, or "
             "tcp://HOST:PORT fallback (default: %(default)s)"
         ),
     )

@@ -99,24 +99,19 @@ def recv_frame_with_optional_fd(sock: socket.socket) -> tuple[dict[str, Any], in
                         pass
                 break
 
-    buf = bytearray(first)
-    while len(buf) < _HEADER.size:
-        buf.extend(recv_exact(sock, _HEADER.size - len(buf)))
-    (size,) = _HEADER.unpack(buf[: _HEADER.size])
-    if size > MAX_FRAME:
-        if fd is not None:
-            os.close(fd)
-        raise ProtocolError(f"control frame exceeds {MAX_FRAME} bytes")
-    total = _HEADER.size + size
-    if len(buf) < total:
-        buf.extend(recv_exact(sock, total - len(buf)))
-    if len(buf) != total:
-        # Synchronous request/response means this should never happen. Refuse to
-        # silently discard bytes because that would desynchronize a persistent stream.
-        if fd is not None:
-            os.close(fd)
-        raise ProtocolError("received bytes beyond the end of a control frame")
     try:
+        buf = bytearray(first)
+        while len(buf) < _HEADER.size:
+            buf.extend(recv_exact(sock, _HEADER.size - len(buf)))
+        (size,) = _HEADER.unpack(buf[: _HEADER.size])
+        if size > MAX_FRAME:
+            raise ProtocolError(f"control frame exceeds {MAX_FRAME} bytes")
+        total = _HEADER.size + size
+        if len(buf) < total:
+            buf.extend(recv_exact(sock, total - len(buf)))
+        if len(buf) != total:
+            # Refuse to discard bytes and desynchronize a persistent stream.
+            raise ProtocolError("received bytes beyond the end of a control frame")
         return decode_frame(bytes(buf)), fd
     except Exception:
         if fd is not None:

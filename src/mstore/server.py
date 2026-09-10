@@ -18,7 +18,7 @@ from .errors import (
     TokenExpired,
     TokenRevoked,
 )
-from .registry import DELETE, INFO, READ, WRITE, Registry
+from .registry import INFO, READ, WRITE, Registry
 from .transport import (
     ControlConnection,
     PipeControlConnection,
@@ -47,8 +47,8 @@ class MStoreServer:
         kind, _ = parse_endpoint(self.endpoint)
         if kind == "tcp" and os.name != "nt":
             raise ValueError(
-                "tcp:// control endpoints cannot carry Linux memfd descriptors; "
-                "use unix:// on Linux"
+                "tcp:// control endpoints cannot carry shared-memory descriptors; "
+                "use unix:// on Linux or macOS"
             )
         self.debug = debug
         self.registry = Registry()
