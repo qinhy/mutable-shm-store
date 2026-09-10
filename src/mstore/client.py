@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import hashlib
 import mmap
 import os
 import threading
@@ -59,12 +58,15 @@ class SharedObject:
         token: str,
         mode: str,
         state: _MappingState,
+        *,
+        cache_hit: bool = False,
     ) -> None:
         self._client = client
         self._info = info
         self.token = token
         self.mode = mode
         self._state = state
+        self._cache_hit = cache_hit
         self._released = False
         self._state.acquire()
 
@@ -97,6 +99,11 @@ class SharedObject:
     @property
     def closed(self) -> bool:
         return self._released or self._state.mapping.closed
+
+    @property
+    def cache_hit(self) -> bool:
+        """True when this lease came entirely from the process-local mapping cache."""
+        return self._cache_hit
 
     def _require_open(self) -> mmap.mmap:
         if self._released or self._state.mapping.closed:
@@ -188,7 +195,13 @@ class Client:
         self._conn: ControlConnection | None = None
         self._request_lock = threading.RLock()
         self._cache_lock = threading.RLock()
-        self._cache: OrderedDict[tuple[str, bytes, str], _MappingState] = OrderedDict()
+        # The raw capability token is intentionally used only as an in-process dict key.
+        # Python's string dict lookup is enough here and avoids computing SHA-256 on a
+        # cache hit. The daemon still stores only SHA-256 token hashes.
+        self._cache: OrderedDict[tuple[str, str, str], _MappingState] = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
         self._pid = os.getpid()
         self._closed = False
 
@@ -207,6 +220,9 @@ class Client:
         self._request_lock = threading.RLock()
         self._cache_lock = threading.RLock()
         self._cache = OrderedDict()
+        self._cache_hits = 0
+        self._cache_misses = 0
+        self._cache_evictions = 0
         self._pid = pid
         self._closed = False
 
@@ -273,19 +289,22 @@ class Client:
             os.close(fd)
         raise ProtocolError(f"unsupported mapping backend: {backend!r}")
 
-    def _cache_get(self, key: tuple[str, bytes, str]) -> _MappingState | None:
+    def _cache_get(self, key: tuple[str, str, str]) -> _MappingState | None:
         with self._cache_lock:
             state = self._cache.get(key)
             if state is None:
+                self._cache_misses += 1
                 return None
             if state.mapping.closed:
                 self._cache.pop(key, None)
                 state.set_cached(False)
+                self._cache_misses += 1
                 return None
             self._cache.move_to_end(key)
+            self._cache_hits += 1
             return state
 
-    def _cache_put(self, key: tuple[str, bytes, str], state: _MappingState) -> None:
+    def _cache_put(self, key: tuple[str, str, str], state: _MappingState) -> None:
         if self.cache_size == 0:
             return
         with self._cache_lock:
@@ -296,18 +315,42 @@ class Client:
             self._cache[key] = state
             while len(self._cache) > self.cache_size:
                 _, evicted = self._cache.popitem(last=False)
+                self._cache_evictions += 1
                 evicted.set_cached(False)
 
-    def clear_cache(self, object_id: str | None = None) -> None:
+    def clear_cache(
+        self,
+        object_id: str | None = None,
+        *,
+        token: str | None = None,
+        mode: str | None = None,
+    ) -> int:
+        """Drop cached mappings matching the supplied filters and return the count."""
+        if mode is not None and mode not in {"read", "write"}:
+            raise ValueError("mode must be 'read' or 'write'")
         with self._cache_lock:
-            if object_id is None:
-                states = list(self._cache.values())
-                self._cache.clear()
-            else:
-                keys = [key for key in self._cache if key[0] == object_id]
-                states = [self._cache.pop(key) for key in keys]
+            keys = [
+                key
+                for key in self._cache
+                if (object_id is None or key[0] == object_id)
+                and (token is None or key[1] == token)
+                and (mode is None or key[2] == mode)
+            ]
+            states = [self._cache.pop(key) for key in keys]
             for state in states:
                 state.set_cached(False)
+            return len(states)
+
+    def cache_info(self) -> dict[str, int]:
+        """Return process-local mapping-cache counters."""
+        with self._cache_lock:
+            return {
+                "size": len(self._cache),
+                "capacity": self.cache_size,
+                "hits": self._cache_hits,
+                "misses": self._cache_misses,
+                "evictions": self._cache_evictions,
+            }
 
     def ping(self) -> dict[str, Any]:
         result, fd = self._request("ping")
@@ -365,19 +408,25 @@ class Client:
     ) -> SharedObject:
         if mode not in {"read", "write"}:
             raise ValueError("mode must be 'read' or 'write'")
-        token_key = hashlib.sha256(token.encode("utf-8")).digest()
-        key = (object_id, token_key, mode)
+        # IMPORTANT: the cache lookup happens before any control-plane work.
+        # On a hit this path performs no Named Pipe/socket round-trip, no daemon-side
+        # SHA-256/registry lock, and no OpenFileMapping/mmap attachment.
+        key = (object_id, token, mode)
         if cache:
             state = self._cache_get(key)
             if state is not None:
-                return SharedObject(self, state.info, token, mode, state)
+                return SharedObject(
+                    self, state.info, token, mode, state, cache_hit=True
+                )
 
         result, fd = self._request("open", object_id=object_id, token=token, mode=mode)
         mapping = self._open_mapping(result["mapping"], fd, mode)
         state = _MappingState(mapping, result["object"])
         if cache:
             self._cache_put(key, state)
-        return SharedObject(self, result["object"], token, mode, state)
+        return SharedObject(
+            self, result["object"], token, mode, state, cache_hit=False
+        )
 
     def issue_token(
         self,

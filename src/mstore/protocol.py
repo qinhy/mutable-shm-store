@@ -80,49 +80,47 @@ def recv_frame_with_optional_fd(sock: socket.socket) -> tuple[dict[str, Any], in
         return recv_frame(sock), None
 
     ancbuf = socket.CMSG_SPACE(array.array("i").itemsize)
-    first, ancdata, flags, _addr = sock.recvmsg(64 * 1024, ancbuf)
+    first, ancdata, _flags, _addr = sock.recvmsg(64 * 1024, ancbuf)
     if not first:
         raise EOFError("connection closed while receiving a control frame")
 
-    received_fds: list[int] = []
+    fd: int | None = None
     for level, kind, data in ancdata:
         if level == socket.SOL_SOCKET and kind == socket.SCM_RIGHTS:
             ints = array.array("i")
             usable = len(data) - (len(data) % ints.itemsize)
             ints.frombytes(data[:usable])
-            received_fds.extend(ints)
+            if ints:
+                fd = ints[0]
+                for extra in ints[1:]:
+                    try:
+                        os.close(extra)
+                    except OSError:
+                        pass
+                break
 
-    fd = received_fds[0] if received_fds else None
-    for extra in received_fds[1:]:
-        try:
-            os.close(extra)
-        except OSError:
-            pass
-
+    buf = bytearray(first)
+    while len(buf) < _HEADER.size:
+        buf.extend(recv_exact(sock, _HEADER.size - len(buf)))
+    (size,) = _HEADER.unpack(buf[: _HEADER.size])
+    if size > MAX_FRAME:
+        if fd is not None:
+            os.close(fd)
+        raise ProtocolError(f"control frame exceeds {MAX_FRAME} bytes")
+    total = _HEADER.size + size
+    if len(buf) < total:
+        buf.extend(recv_exact(sock, total - len(buf)))
+    if len(buf) != total:
+        # Synchronous request/response means this should never happen. Refuse to
+        # silently discard bytes because that would desynchronize a persistent stream.
+        if fd is not None:
+            os.close(fd)
+        raise ProtocolError("received bytes beyond the end of a control frame")
     try:
-        if flags & getattr(socket, "MSG_CTRUNC", 0):
-            raise ProtocolError("control frame ancillary data was truncated")
-
-        buf = bytearray(first)
-        while len(buf) < _HEADER.size:
-            buf.extend(recv_exact(sock, _HEADER.size - len(buf)))
-        (size,) = _HEADER.unpack(buf[: _HEADER.size])
-        if size > MAX_FRAME:
-            raise ProtocolError(f"control frame exceeds {MAX_FRAME} bytes")
-        total = _HEADER.size + size
-        if len(buf) < total:
-            buf.extend(recv_exact(sock, total - len(buf)))
-        if len(buf) != total:
-            # Synchronous request/response means this should never happen. Refuse to
-            # silently discard bytes because that would desynchronize a persistent stream.
-            raise ProtocolError("received bytes beyond the end of a control frame")
         return decode_frame(bytes(buf)), fd
     except Exception:
         if fd is not None:
-            try:
-                os.close(fd)
-            except OSError:
-                pass
+            os.close(fd)
         raise
 
 

@@ -18,7 +18,7 @@ from .errors import (
     TokenExpired,
     TokenRevoked,
 )
-from .registry import INFO, READ, WRITE, Registry
+from .registry import DELETE, INFO, READ, WRITE, Registry
 from .transport import (
     ControlConnection,
     PipeControlConnection,
