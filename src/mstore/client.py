@@ -113,12 +113,13 @@ class SharedObject:
     def numpy(self) -> np.ndarray:
         if self.shape is None or self.dtype is None:
             raise TypeError("this object has no NumPy shape/dtype metadata")
-        arr = np.ndarray(
-            self.shape,
-            dtype=self.dtype,
-            buffer=self._require_open(),
-            order=self._info.get("order", "C"),
-        )
+        # np.frombuffer keeps a buffer export on the mmap for as long as the array
+        # lives, so mmap.close() raises BufferError instead of unmapping memory the
+        # array still points at. np.ndarray(buffer=mmap) holds no export, and closing
+        # the SharedObject while such an array was alive caused a segfault on access.
+        count = int(np.prod(self.shape, dtype=np.int64))
+        flat = np.frombuffer(self._require_open(), dtype=self.dtype, count=count)
+        arr = flat.reshape(self.shape, order=self._info.get("order", "C"))
         if self.mode == "read":
             arr.flags.writeable = False
         return arr
@@ -142,11 +143,27 @@ class SharedObject:
             expires_in=expires_in,
         )
 
+    def make_public(self, permissions: str | Iterable[str] = "read") -> list[str]:
+        """Let anyone who can reach the server use this object without a token.
+
+        ``permissions`` is a level ("info", "read" or "write") or a permission set.
+        """
+        return self._client.set_public(self.object_id, self.token, permissions)
+
+    def make_private(self) -> None:
+        """Stop anonymous opens. Mappings that already exist keep working."""
+        self._client.set_public(self.object_id, self.token, "none")
+
     def revoke(self, target_token: str) -> None:
         self._client.revoke_token(self.object_id, self.token, target_token)
 
     def info(self) -> dict[str, Any]:
         return self._client.info(self.object_id, self.token)
+
+    @property
+    def public_level(self) -> str:
+        """Public level when this handle was opened ("none" if private)."""
+        return str(self._info.get("public_level", "none"))
 
     def delete(self) -> None:
         self._client.delete(self.object_id, self.token)
@@ -401,7 +418,7 @@ class Client:
     def open(
         self,
         object_id: str,
-        token: str,
+        token: str = "",
         *,
         mode: str = "read",
         cache: bool = False,
@@ -461,7 +478,19 @@ class Client:
         if not result.get("revoked"):
             raise ProtocolError("server did not confirm token revocation")
 
-    def info(self, object_id: str, token: str) -> dict[str, Any]:
+    def set_public(
+        self, object_id: str, issuer_token: str, permissions: str | Iterable[str]
+    ) -> list[str]:
+        if not isinstance(permissions, str):
+            permissions = list(permissions)
+        result, fd = self._request(
+            "set_public", object_id=object_id, token=issuer_token, permissions=permissions
+        )
+        if fd is not None:
+            os.close(fd)
+        return list(result["public"])
+
+    def info(self, object_id: str, token: str = "") -> dict[str, Any]:
         result, fd = self._request("info", object_id=object_id, token=token)
         if fd is not None:
             os.close(fd)

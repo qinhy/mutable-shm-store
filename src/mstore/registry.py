@@ -17,33 +17,17 @@ from .errors import (
     TokenRevoked,
 )
 from .models import ObjectRecord, TokenRecord
-
-READ = "read"
-WRITE = "write"
-GRANT = "grant"
-DELETE = "delete"
-INFO = "info"
-ALL_PERMISSIONS = frozenset({READ, WRITE, GRANT, DELETE, INFO})
-
-
-def normalize_permissions(value: str | Iterable[str]) -> frozenset[str]:
-    if isinstance(value, str):
-        if value == "read":
-            return frozenset({READ, INFO})
-        if value == "write":
-            return frozenset({READ, WRITE, INFO})
-        if value == "admin":
-            return ALL_PERMISSIONS
-        value = [value]
-    result = set(value)
-    unknown = result - ALL_PERMISSIONS
-    if unknown:
-        raise InvalidRequest(f"unknown permissions: {sorted(unknown)}")
-    if WRITE in result:
-        result.add(READ)
-    if result:
-        result.add(INFO)
-    return frozenset(result)
+from .permissions import (  # re-exported: server.py and older code import these from here
+    ALL_PERMISSIONS,
+    DELETE,
+    GRANT,
+    INFO,
+    MAX_PUBLIC_LEVEL,
+    PUBLIC_ALLOWED,
+    READ,
+    WRITE,
+    normalize_permissions,
+)
 
 
 def _hash_token(raw: str) -> str:
@@ -106,9 +90,7 @@ class Registry:
         object_id: str,
         raw_token: str,
         required: str | Iterable[str],
-    ) -> tuple[ObjectRecord, TokenRecord]:
-        if not raw_token:
-            raise AuthenticationError("missing token")
+    ) -> tuple[ObjectRecord, TokenRecord | None]:
         required_set = normalize_permissions(required)
         # INFO is automatically inserted by normalize_permissions; it is not required
         # merely because the requested permission includes another operation.
@@ -118,6 +100,11 @@ class Registry:
             obj = self._objects.get(object_id)
             if obj is None:
                 raise ObjectNotFound(f"object {object_id!r} does not exist")
+            if not raw_token:
+                # Anonymous request: allowed only for permissions the owner made public.
+                if required_set <= obj.public_permissions:
+                    return obj, None
+                raise AuthenticationError("missing token")
             token = self._tokens.get(_hash_token(raw_token))
             if token is None or token.object_id != object_id:
                 raise AuthenticationError("invalid token")
@@ -156,6 +143,22 @@ class Registry:
             elif issuer.expires_at is not None:
                 expires_at = issuer.expires_at
             return self._issue_locked(obj, requested, expires_at)
+
+    def set_public(
+        self, object_id: str, issuer_raw: str, permissions: str | Iterable[str]
+    ) -> frozenset[str]:
+        requested = normalize_permissions(permissions)
+        if requested - PUBLIC_ALLOWED:
+            raise InvalidRequest(
+                f"public access is limited to the {MAX_PUBLIC_LEVEL!r} level "
+                f"({sorted(PUBLIC_ALLOWED)})"
+            )
+        with self._lock:
+            obj, issuer = self.validate(object_id, issuer_raw, GRANT)
+            if not requested <= issuer.permissions:
+                raise PermissionDenied("cannot make public a permission the issuer lacks")
+            obj.public_permissions = requested
+            return requested
 
     def revoke_token(self, object_id: str, issuer_raw: str, target_raw: str) -> None:
         with self._lock:

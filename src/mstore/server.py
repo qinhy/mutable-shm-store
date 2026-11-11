@@ -18,6 +18,7 @@ from .errors import (
     TokenExpired,
     TokenRevoked,
 )
+from .permissions import level_of
 from .registry import INFO, READ, WRITE, Registry
 from .transport import (
     ControlConnection,
@@ -306,8 +307,9 @@ class MStoreServer:
             obj, tok = self.registry.validate(object_id, token, INFO)
             return {
                 "object": obj.public(),
-                "token": {
+                "token": None if tok is None else {
                     "permissions": sorted(tok.permissions),
+                    "level": level_of(tok.permissions),
                     "expires_at": tok.expires_at,
                 },
             }, None
@@ -320,6 +322,10 @@ class MStoreServer:
                 args.get("expires_in"),
             )
             return {"token": issued}, None
+
+        if op == "set_public":
+            public = self.registry.set_public(object_id, token, args.get("permissions") or [])
+            return {"public": sorted(public), "level": level_of(public)}, None
 
         if op == "revoke":
             target = str(args.get("target_token") or "")

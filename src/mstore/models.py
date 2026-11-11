@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from .backend import Region
+from .permissions import level_of
 
 
 @dataclass
@@ -17,6 +18,7 @@ class ObjectRecord:
     order: str = "C"
     metadata: dict[str, Any] = field(default_factory=dict)
     created_at: float = 0.0
+    public_permissions: frozenset[str] = frozenset()
 
     def public(self) -> dict[str, Any]:
         return {
@@ -28,6 +30,8 @@ class ObjectRecord:
             "order": self.order,
             "metadata": self.metadata,
             "created_at": self.created_at,
+            "public": sorted(self.public_permissions),
+            "public_level": level_of(self.public_permissions),
         }
 
 
