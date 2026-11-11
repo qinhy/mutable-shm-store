@@ -101,9 +101,16 @@ class Registry:
         return obj, token
 
     def _issue_locked(
-        self, obj: ObjectRecord, permissions: frozenset[str], expires_at: float | None
+        self, obj: ObjectRecord, permissions: frozenset[str], expires_at: float | None,
+        raw: str | None = None,
     ) -> str:
-        raw = secrets.token_urlsafe(32)
+        if raw is None:
+            raw = secrets.token_urlsafe(32)
+        elif not isinstance(raw, str) or not raw:
+            raise InvalidRequest("custom token must be a non-empty string")
+        elif _hash_token(raw) in self._tokens:
+            # Tokens are looked up globally; a duplicate would hijack another object's token.
+            raise InvalidRequest("token is already in use")
         now = time.time()
         record = TokenRecord(
             token_hash=_hash_token(raw),
@@ -157,23 +164,27 @@ class Registry:
         issuer_raw: str,
         permissions: str | Iterable[str],
         expires_in: float | None,
+        token: str | None = None,
     ) -> str:
         requested = normalize_permissions(permissions)
         with self._lock:
             obj, issuer = self.validate(object_id, issuer_raw, GRANT)
-            # A grant-capable token cannot delegate permissions it doesn't itself possess.
-            if not requested.issubset(issuer.permissions):
+            # issuer is None for a token-less caller acting through public access.
+            issuer_permissions = issuer.permissions if issuer else obj.public_permissions
+            issuer_expires_at = issuer.expires_at if issuer else None
+            # A grant-capable caller cannot delegate permissions it doesn't itself possess.
+            if not requested.issubset(issuer_permissions):
                 raise PermissionDenied("cannot delegate permissions the issuer does not possess")
             expires_at = None
             if expires_in is not None:
                 if expires_in <= 0:
                     raise InvalidRequest("expires_in must be > 0")
                 expires_at = time.time() + float(expires_in)
-                if issuer.expires_at is not None:
-                    expires_at = min(expires_at, issuer.expires_at)
-            elif issuer.expires_at is not None:
-                expires_at = issuer.expires_at
-            return self._issue_locked(obj, requested, expires_at)
+                if issuer_expires_at is not None:
+                    expires_at = min(expires_at, issuer_expires_at)
+            elif issuer_expires_at is not None:
+                expires_at = issuer_expires_at
+            return self._issue_locked(obj, requested, expires_at, token)
 
     def set_public(
         self, object_id: str, issuer_raw: str, permissions: str | Iterable[str]
@@ -186,7 +197,8 @@ class Registry:
             )
         with self._lock:
             obj, issuer = self.validate(object_id, issuer_raw, GRANT)
-            if not requested <= issuer.permissions:
+            issuer_permissions = issuer.permissions if issuer else obj.public_permissions
+            if not requested <= issuer_permissions:
                 raise PermissionDenied("cannot make public a permission the issuer lacks")
             obj.public_permissions = requested
             return requested

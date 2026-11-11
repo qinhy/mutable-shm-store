@@ -108,12 +108,31 @@ def test_public_write_and_limits(server):
     del view
     writer.close()
     assert owner.numpy()[0] == 9
-    for too_high in ("share", "admin", ["delete"]):
-        with pytest.raises(InvalidRequest, match="public access is limited"):
-            owner.make_public(too_high)
     reader = store.open(owner.object_id, owner.issue("read"))
     with pytest.raises(PermissionDenied):
         reader.make_public("read")                # needs the grant permission
+    sharer = store.open(owner.object_id, owner.issue("share"), mode="write")
+    with pytest.raises(PermissionDenied):
+        sharer.make_public("admin")               # cannot publish more than it holds
+
+
+def test_public_admin_lets_anyone_delete_and_grant(server):
+    owner_client = mstore.connect(server.endpoint)
+    owner = owner_client.create(shape=(4,), dtype=np.uint8)
+    owner.make_public("admin")
+
+    anyone = mstore.connect(server.endpoint)      # no token anywhere below
+    assert anyone.info(owner.object_id)["object"]["public_level"] == "admin"
+    handle = anyone.open(owner.object_id, mode="write")
+    token = handle.issue("read")                  # token-less grant works
+    assert anyone.info(owner.object_id, token)["token"]["level"] == "read"
+    handle.make_public("read")                    # ... and can lower public access
+    with pytest.raises(AuthenticationError):
+        handle.delete()                           # which now applies to itself too
+    owner.make_public("admin")
+    handle.delete()                               # token-less delete
+    with pytest.raises(mstore.ObjectNotFound):
+        anyone.info(owner.object_id)
 
 
 # ---- regression: closing a handle under a live NumPy view ------------------
@@ -137,3 +156,19 @@ def test_numpy_view_shape_and_order(server, order):
     assert arr.flags.f_contiguous if order == "F" else arr.flags.c_contiguous
     reader = store.open(owner.object_id, owner.issue("read")).numpy()
     assert reader.tolist() == arr.tolist()
+
+
+# ---- caller-chosen token values --------------------------------------------
+
+def test_custom_token_value(server):
+    store = mstore.connect(server.endpoint)
+    owner = store.create(size=16)
+    assert owner.issue("read", token="123") == "123"
+    assert store.open(owner.object_id, "123").size == 16
+    other = store.create(size=16)
+    with pytest.raises(InvalidRequest, match="already in use"):
+        other.issue("read", token="123")          # tokens are global: no duplicates
+    with pytest.raises(InvalidRequest):
+        owner.issue("read", token="")
+    owner.delete()
+    assert other.issue("read", token="123") == "123"   # free again after delete

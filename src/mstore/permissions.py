@@ -43,8 +43,10 @@ PERMISSION_LEVELS: dict[str, frozenset[str]] = {
 LEVEL_ORDER: tuple[str, ...] = tuple(PERMISSION_LEVELS)
 
 # The highest level that may be given to everyone (anonymous, token-less access).
-# grant/delete are never public: anyone could mint tokens or destroy the object.
-MAX_PUBLIC_LEVEL = "write"
+# "admin" means anyone who can reach the server may also delete the object and
+# issue tokens for it: right for shared caches, wrong for data you want to keep.
+# Lower this (e.g. to "write") to forbid that server-wide.
+MAX_PUBLIC_LEVEL = "admin"
 PUBLIC_ALLOWED = PERMISSION_LEVELS[MAX_PUBLIC_LEVEL]
 
 

@@ -135,18 +135,22 @@ class SharedObject:
         permissions: str | Iterable[str] = "read",
         *,
         expires_in: float | None = None,
+        token: str | None = None,
     ) -> str:
+        """Issue a token. ``token`` picks its value instead of a random one."""
         return self._client.issue_token(
             self.object_id,
             self.token,
             permissions,
             expires_in=expires_in,
+            token=token,
         )
 
     def make_public(self, permissions: str | Iterable[str] = "read") -> list[str]:
         """Let anyone who can reach the server use this object without a token.
 
-        ``permissions`` is a level ("info", "read" or "write") or a permission set.
+        ``permissions`` is a level ("info", "read", "write", "share", "admin") or a
+        permission set. With "admin", anyone may also delete the object.
         """
         return self._client.set_public(self.object_id, self.token, permissions)
 
@@ -459,6 +463,7 @@ class Client:
         permissions: str | Iterable[str],
         *,
         expires_in: float | None = None,
+        token: str | None = None,
     ) -> str:
         if not isinstance(permissions, str):
             permissions = list(permissions)
@@ -468,6 +473,7 @@ class Client:
             token=issuer_token,
             permissions=permissions,
             expires_in=expires_in,
+            **({"custom_token": token} if token is not None else {}),
         )
         if fd is not None:
             os.close(fd)
