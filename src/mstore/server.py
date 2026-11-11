@@ -12,6 +12,7 @@ from .errors import (
     AuthenticationError,
     InvalidRequest,
     MStoreError,
+    ObjectExists,
     ObjectNotFound,
     PermissionDenied,
     ProtocolError,
@@ -35,6 +36,7 @@ ERROR_CODES = {
     AuthenticationError: "authentication_error",
     PermissionDenied: "permission_denied",
     ObjectNotFound: "object_not_found",
+    ObjectExists: "object_exists",
     TokenExpired: "token_expired",
     TokenRevoked: "token_revoked",
     InvalidRequest: "invalid_request",
@@ -285,6 +287,7 @@ class MStoreServer:
                 dtype=args.get("dtype"),
                 order=args.get("order", "C"),
                 metadata=args.get("metadata") or {},
+                object_id=args.get("object_id"),
             )
             mapping, fd = obj.region.client_mapping("write")
             return {"object": obj.public(), "token": token, "mapping": mapping}, fd

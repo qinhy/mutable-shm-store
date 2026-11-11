@@ -383,7 +383,13 @@ class Client:
         dtype: Any | None = None,
         order: str = "C",
         metadata: dict[str, Any] | None = None,
+        object_id: str | None = None,
     ) -> SharedObject:
+        """Create a shared object.
+
+        ``object_id`` picks a fixed id (1-64 chars of letters, digits, ``_.-``)
+        instead of a random one; ObjectExists is raised if it is already in use.
+        """
         shape_list: list[int] | None = None
         dtype_string: str | None = None
         if shape is not None or dtype is not None:
@@ -409,6 +415,7 @@ class Client:
             dtype=dtype_string,
             order=order,
             metadata=metadata or {},
+            **({"object_id": object_id} if object_id is not None else {}),
         )
         token = str(result["token"])
         mapping = self._open_mapping(result["mapping"], fd, "write")

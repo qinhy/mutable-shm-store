@@ -18,6 +18,10 @@ class ObjectNotFound(MStoreError):
     pass
 
 
+class ObjectExists(MStoreError):
+    pass
+
+
 class TokenExpired(MStoreError):
     pass
 
@@ -34,6 +38,7 @@ ERROR_TYPES = {
     "authentication_error": AuthenticationError,
     "permission_denied": PermissionDenied,
     "object_not_found": ObjectNotFound,
+    "object_exists": ObjectExists,
     "token_expired": TokenExpired,
     "token_revoked": TokenRevoked,
     "invalid_request": InvalidRequest,

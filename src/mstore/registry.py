@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import re
 import secrets
 import threading
 import time
@@ -11,6 +12,7 @@ from .backend import create_region
 from .errors import (
     AuthenticationError,
     InvalidRequest,
+    ObjectExists,
     ObjectNotFound,
     PermissionDenied,
     TokenExpired,
@@ -28,6 +30,20 @@ from .permissions import (  # re-exported: server.py and older code import these
     WRITE,
     normalize_permissions,
 )
+
+
+# Caller-chosen ids end up in OS object names (memfd name, Windows mapping name),
+# so keep them short and to a portable character set.
+OBJECT_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,63}")
+
+
+def validate_object_id(object_id: str) -> str:
+    if not isinstance(object_id, str) or not OBJECT_ID_PATTERN.fullmatch(object_id):
+        raise InvalidRequest(
+            "object_id must be 1-64 characters of letters, digits, '_', '.' or '-', "
+            "starting with a letter or digit"
+        )
+    return object_id
 
 
 def _hash_token(raw: str) -> str:
@@ -48,10 +64,17 @@ class Registry:
         dtype: str | None,
         order: str,
         metadata: dict[str, Any],
+        object_id: str | None = None,
     ) -> tuple[ObjectRecord, str]:
         if size <= 0:
             raise InvalidRequest("size must be > 0")
-        object_id = uuid.uuid4().hex
+        if object_id is None:
+            object_id = uuid.uuid4().hex
+        else:
+            validate_object_id(object_id)
+            with self._lock:  # fail fast before allocating shared memory
+                if object_id in self._objects:
+                    raise ObjectExists(f"object {object_id!r} already exists")
         region = create_region(size, object_id)
         now = time.time()
         obj = ObjectRecord(
@@ -65,8 +88,16 @@ class Registry:
             created_at=now,
         )
         with self._lock:
-            self._objects[object_id] = obj
-            token = self._issue_locked(obj, ALL_PERMISSIONS, None)
+            # Re-check: another client may have taken the id while the region was made.
+            if object_id in self._objects:
+                taken = True
+            else:
+                taken = False
+                self._objects[object_id] = obj
+                token = self._issue_locked(obj, ALL_PERMISSIONS, None)
+        if taken:
+            region.close()
+            raise ObjectExists(f"object {object_id!r} already exists")
         return obj, token
 
     def _issue_locked(
