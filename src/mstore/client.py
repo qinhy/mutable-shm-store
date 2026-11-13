@@ -5,10 +5,12 @@ import os
 import threading
 from collections import OrderedDict
 from typing import Any, Iterable
+from urllib.parse import urlencode, urlparse, parse_qsl
 
 import numpy as np
 
 from .errors import ERROR_TYPES, MStoreError, ProtocolError
+from .permissions import PermissionLevel, has_level, validate_level
 from .transport import ControlConnection, connect_control, default_endpoint
 
 
@@ -132,7 +134,7 @@ class SharedObject:
 
     def issue(
         self,
-        permissions: str | Iterable[str] = "read",
+        level: PermissionLevel = "read",
         *,
         expires_in: float | None = None,
         token: str | None = None,
@@ -141,18 +143,38 @@ class SharedObject:
         return self._client.issue_token(
             self.object_id,
             self.token,
-            permissions,
+            level,
             expires_in=expires_in,
             token=token,
         )
 
-    def make_public(self, permissions: str | Iterable[str] = "read") -> list[str]:
+    def issue_url(
+        self,
+        level: PermissionLevel = "read",
+        *,
+        expires_in: float | None = None,
+        token: str | None = None,
+    ) -> str:
+        """Issue a token and return it as an ``mstore://`` URL.
+        Format: mstore://<object_id>/?token=<token>&mode=<read-or-write>
+        """
+        # URL mode controls the memory mapping, not the delegated token level.
+        # Higher access levels may open read-write mappings.
+        validate_level(level)
+        if not has_level(level, "read"):
+            raise ValueError("issue_url requires at least 'read' permission")
+        mode = "read" if level == "read" else "write"
+        issued = self.issue(level, expires_in=expires_in, token=token)
+        query = urlencode({"token": issued, "mode": mode})
+        return f"mstore://{self.object_id}/?{query}"
+    
+    def make_public(self, level: PermissionLevel = "read") -> str:
         """Let anyone who can reach the server use this object without a token.
 
-        ``permissions`` is a level ("info", "read", "write", "share", "admin") or a
-        permission set. With "admin", anyone may also delete the object.
+        ``level`` must be one of the named levels. With "admin",
+        anyone who can reach the server may delete the object.
         """
-        return self._client.set_public(self.object_id, self.token, permissions)
+        return self._client.set_public(self.object_id, self.token, level)
 
     def make_private(self) -> None:
         """Stop anonymous opens. Mappings that already exist keep working."""
@@ -456,22 +478,46 @@ class Client:
             self, result["object"], token, mode, state, cache_hit=False
         )
 
+    def open_url(
+        self,
+        url: str,
+        *,
+        mode: str | None = None,
+        cache: bool = False,
+    ) -> SharedObject:
+        """Open a shared object from an ``mstore://`` URL.
+        mstore://<object_id>/token=<token>&mode=<mode>      (params in path)
+        mstore://<object_id>/?token=<token>&mode=<mode>      (standard query)
+        """
+        p = urlparse(url)
+        if p.scheme != "mstore": raise ValueError(f"expected mstore:// URL, got scheme {p.scheme!r}")
+        object_id = p.netloc
+        if not object_id: raise ValueError("URL is missing the object id")
+
+        # Standard form uses ?query; the legacy form puts params in the path.
+        raw = p.query or p.path.lstrip("/")
+        params = dict(parse_qsl(raw, keep_blank_values=True))
+
+        token = params.get("token", "")
+        resolved_mode = mode or params.get("mode") or "read"
+
+        return self.open(object_id, token, mode=resolved_mode, cache=cache)
+    
     def issue_token(
         self,
         object_id: str,
         issuer_token: str,
-        permissions: str | Iterable[str],
+        level: PermissionLevel,
         *,
         expires_in: float | None = None,
         token: str | None = None,
     ) -> str:
-        if not isinstance(permissions, str):
-            permissions = list(permissions)
+        validate_level(level)
         result, fd = self._request(
             "grant",
             object_id=object_id,
             token=issuer_token,
-            permissions=permissions,
+            level=level,
             expires_in=expires_in,
             **({"custom_token": token} if token is not None else {}),
         )
@@ -492,16 +538,15 @@ class Client:
             raise ProtocolError("server did not confirm token revocation")
 
     def set_public(
-        self, object_id: str, issuer_token: str, permissions: str | Iterable[str]
-    ) -> list[str]:
-        if not isinstance(permissions, str):
-            permissions = list(permissions)
+        self, object_id: str, issuer_token: str, level: PermissionLevel
+    ) -> str:
+        validate_level(level)
         result, fd = self._request(
-            "set_public", object_id=object_id, token=issuer_token, permissions=permissions
+            "set_public", object_id=object_id, token=issuer_token, level=level
         )
         if fd is not None:
             os.close(fd)
-        return list(result["public"])
+        return str(result["level"])
 
     def info(self, object_id: str, token: str = "") -> dict[str, Any]:
         result, fd = self._request("info", object_id=object_id, token=token)

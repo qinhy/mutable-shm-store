@@ -10,7 +10,7 @@ from .errors import (
     TokenExpired,
     TokenRevoked,
 )
-from .permissions import LEVEL_ORDER, PERMISSION_LEVELS, has_level, level_of
+from .permissions import LEVEL_ORDER, PermissionLevel, has_level, validate_level
 from .server import MStoreServer, default_endpoint
 
 __all__ = [
@@ -22,7 +22,7 @@ __all__ = [
     "MStoreServer",
     "ObjectExists",
     "ObjectNotFound",
-    "PERMISSION_LEVELS",
+    "PermissionLevel",
     "PermissionDenied",
     "ProtocolError",
     "SharedObject",
@@ -31,7 +31,7 @@ __all__ = [
     "connect",
     "default_endpoint",
     "has_level",
-    "level_of",
+    "validate_level",
 ]
 
 __version__ = "0.3.0"

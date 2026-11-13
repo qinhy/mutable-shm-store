@@ -11,12 +11,12 @@ def test_persistent_create_open_mutate_and_readonly(server):
         owner = client.create(shape=(32,), dtype=np.int64)
         arr = owner.numpy()
         arr[:] = np.arange(32)
-        token = owner.issue("write")
+        token = owner.issue(level="write")
 
         with client.open(owner.object_id, token, mode="write") as other:
             other.numpy()[0] = 1234
 
-        read_token = owner.issue("read")
+        read_token = owner.issue(level="read")
         with client.open(owner.object_id, read_token, mode="read") as ro:
             view = ro.numpy()
             assert view[0] == 1234
@@ -35,7 +35,7 @@ def test_persistent_create_open_mutate_and_readonly(server):
 def test_cache_hit_bypasses_control_plane_and_mapping_attach(server):
     with Client(server.endpoint, cache_size=4) as client:
         owner = client.create(shape=(8,), dtype=np.uint8)
-        token = owner.issue("write")
+        token = owner.issue(level="write")
 
         first = client.open(owner.object_id, token, mode="write", cache=True)
         assert not first.cache_hit
@@ -71,7 +71,7 @@ def test_cache_hit_bypasses_control_plane_and_mapping_attach(server):
 def test_revoked_capability_cannot_reopen_after_cache_clear(server):
     with Client(server.endpoint, cache_size=4) as client:
         owner = client.create(shape=(8,), dtype=np.uint8)
-        token = owner.issue("read")
+        token = owner.issue(level="read")
 
         cached = client.open(owner.object_id, token, mode="read", cache=True)
         cached.close()

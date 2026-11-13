@@ -14,7 +14,7 @@ def test_fixed_object_id_with_public_access(server):
     owner = store.create(shape=(4,), dtype=np.uint8, object_id="camera-frame")
     assert owner.object_id == "camera-frame"
     owner.numpy()[:] = [1, 2, 3, 4]
-    owner.make_public("read")
+    owner.make_public(level="read")
 
     other = mstore.connect(server.endpoint)  # e.g. another process
     assert other.open("camera-frame").numpy().tolist() == [1, 2, 3, 4]

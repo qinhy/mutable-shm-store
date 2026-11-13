@@ -19,8 +19,8 @@ from .errors import (
     TokenExpired,
     TokenRevoked,
 )
-from .permissions import level_of
-from .registry import INFO, READ, WRITE, Registry
+from .permissions import validate_level
+from .registry import Registry
 from .transport import (
     ControlConnection,
     PipeControlConnection,
@@ -299,7 +299,7 @@ class MStoreServer:
 
         if op == "open":
             mode = args.get("mode", "read")
-            required = WRITE if mode == "write" else READ if mode == "read" else None
+            required = "write" if mode == "write" else "read" if mode == "read" else None
             if required is None:
                 raise InvalidRequest("mode must be 'read' or 'write'")
             obj, _ = self.registry.validate(object_id, token, required)
@@ -307,28 +307,32 @@ class MStoreServer:
             return {"object": obj.public(), "mapping": mapping}, fd
 
         if op == "info":
-            obj, tok = self.registry.validate(object_id, token, INFO)
+            obj, tok = self.registry.validate(object_id, token, "info")
             return {
                 "object": obj.public(),
                 "token": None if tok is None else {
-                    "permissions": sorted(tok.permissions),
-                    "level": level_of(tok.permissions),
+                    "level": tok.level,
                     "expires_at": tok.expires_at,
                 },
             }, None
 
         if op == "grant":
+            if "permissions" in args:
+                raise InvalidRequest("use 'level', not 'permissions'")
             issued = self.registry.issue_token(
                 object_id,
                 token,
-                args.get("permissions", "read"),
+                args.get("level", "read"),
                 args.get("expires_in"),
+                token=args.get("custom_token"),
             )
             return {"token": issued}, None
 
         if op == "set_public":
-            public = self.registry.set_public(object_id, token, args.get("permissions") or [])
-            return {"public": sorted(public), "level": level_of(public)}, None
+            if "permissions" in args:
+                raise InvalidRequest("use 'level', not 'permissions'")
+            level = self.registry.set_public(object_id, token, args.get("level", "none"))
+            return {"level": level}, None
 
         if op == "revoke":
             target = str(args.get("target_token") or "")

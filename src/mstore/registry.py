@@ -6,7 +6,7 @@ import secrets
 import threading
 import time
 import uuid
-from typing import Any, Iterable
+from typing import Any
 
 from .backend import create_region
 from .errors import (
@@ -19,17 +19,7 @@ from .errors import (
     TokenRevoked,
 )
 from .models import ObjectRecord, TokenRecord
-from .permissions import (  # re-exported: server.py and older code import these from here
-    ALL_PERMISSIONS,
-    DELETE,
-    GRANT,
-    INFO,
-    MAX_PUBLIC_LEVEL,
-    PUBLIC_ALLOWED,
-    READ,
-    WRITE,
-    normalize_permissions,
-)
+from .permissions import PermissionLevel, MAX_PUBLIC_LEVEL, has_level, validate_level
 
 
 # Caller-chosen ids end up in OS object names (memfd name, Windows mapping name),
@@ -94,14 +84,14 @@ class Registry:
             else:
                 taken = False
                 self._objects[object_id] = obj
-                token = self._issue_locked(obj, ALL_PERMISSIONS, None)
+                token = self._issue_locked(obj, "admin", None)
         if taken:
             region.close()
             raise ObjectExists(f"object {object_id!r} already exists")
         return obj, token
 
     def _issue_locked(
-        self, obj: ObjectRecord, permissions: frozenset[str], expires_at: float | None,
+        self, obj: ObjectRecord, level: PermissionLevel, expires_at: float | None,
         raw: str | None = None,
     ) -> str:
         if raw is None:
@@ -115,7 +105,7 @@ class Registry:
         record = TokenRecord(
             token_hash=_hash_token(raw),
             object_id=obj.object_id,
-            permissions=permissions,
+            level=level,
             generation=obj.generation,
             created_at=now,
             expires_at=expires_at,
@@ -127,20 +117,15 @@ class Registry:
         self,
         object_id: str,
         raw_token: str,
-        required: str | Iterable[str],
+        required: PermissionLevel,
     ) -> tuple[ObjectRecord, TokenRecord | None]:
-        required_set = normalize_permissions(required)
-        # INFO is automatically inserted by normalize_permissions; it is not required
-        # merely because the requested permission includes another operation.
-        if isinstance(required, str) and required != INFO:
-            required_set = frozenset({required})
+        validate_level(required)
         with self._lock:
             obj = self._objects.get(object_id)
             if obj is None:
                 raise ObjectNotFound(f"object {object_id!r} does not exist")
             if not raw_token:
-                # Anonymous request: allowed only for permissions the owner made public.
-                if required_set <= obj.public_permissions:
+                if has_level(obj.public_level, required):
                     return obj, None
                 raise AuthenticationError("missing token")
             token = self._tokens.get(_hash_token(raw_token))
@@ -148,33 +133,29 @@ class Registry:
                 raise AuthenticationError("invalid token")
             if token.revoked:
                 raise TokenRevoked("token has been revoked")
-            now = time.time()
-            if token.expires_at is not None and now >= token.expires_at:
+            if token.expires_at is not None and time.time() >= token.expires_at:
                 raise TokenExpired("token has expired")
             if token.generation != obj.generation:
                 raise AuthenticationError("token belongs to a stale object generation")
-            missing = required_set - token.permissions
-            if missing:
-                raise PermissionDenied(f"token lacks permission(s): {sorted(missing)}")
+            if not has_level(token.level, required):
+                raise PermissionDenied(f"requires {required!r} level; token has {token.level!r}")
             return obj, token
 
     def issue_token(
         self,
         object_id: str,
         issuer_raw: str,
-        permissions: str | Iterable[str],
+        level: PermissionLevel,
         expires_in: float | None,
         token: str | None = None,
     ) -> str:
-        requested = normalize_permissions(permissions)
+        validate_level(level)
         with self._lock:
-            obj, issuer = self.validate(object_id, issuer_raw, GRANT)
-            # issuer is None for a token-less caller acting through public access.
-            issuer_permissions = issuer.permissions if issuer else obj.public_permissions
+            obj, issuer = self.validate(object_id, issuer_raw, "share")
+            issuer_level = issuer.level if issuer else obj.public_level
             issuer_expires_at = issuer.expires_at if issuer else None
-            # A grant-capable caller cannot delegate permissions it doesn't itself possess.
-            if not requested.issubset(issuer_permissions):
-                raise PermissionDenied("cannot delegate permissions the issuer does not possess")
+            if not has_level(issuer_level, level):
+                raise PermissionDenied("cannot delegate a level higher than the issuer's")
             expires_at = None
             if expires_in is not None:
                 if expires_in <= 0:
@@ -184,38 +165,35 @@ class Registry:
                     expires_at = min(expires_at, issuer_expires_at)
             elif issuer_expires_at is not None:
                 expires_at = issuer_expires_at
-            return self._issue_locked(obj, requested, expires_at, token)
+            return self._issue_locked(obj, level, expires_at, token)
 
     def set_public(
-        self, object_id: str, issuer_raw: str, permissions: str | Iterable[str]
-    ) -> frozenset[str]:
-        requested = normalize_permissions(permissions)
-        if requested - PUBLIC_ALLOWED:
-            raise InvalidRequest(
-                f"public access is limited to the {MAX_PUBLIC_LEVEL!r} level "
-                f"({sorted(PUBLIC_ALLOWED)})"
-            )
+        self, object_id: str, issuer_raw: str, level: PermissionLevel
+    ) -> PermissionLevel:
+        validate_level(level)
+        if not has_level(MAX_PUBLIC_LEVEL, level):
+            raise InvalidRequest(f"public access is limited to {MAX_PUBLIC_LEVEL!r}")
         with self._lock:
-            obj, issuer = self.validate(object_id, issuer_raw, GRANT)
-            issuer_permissions = issuer.permissions if issuer else obj.public_permissions
-            if not requested <= issuer_permissions:
-                raise PermissionDenied("cannot make public a permission the issuer lacks")
-            obj.public_permissions = requested
-            return requested
+            obj, issuer = self.validate(object_id, issuer_raw, "share")
+            issuer_level = issuer.level if issuer else obj.public_level
+            if not has_level(issuer_level, level):
+                raise PermissionDenied("cannot make public a level higher than the issuer's")
+            obj.public_level = level
+            return level
 
     def revoke_token(self, object_id: str, issuer_raw: str, target_raw: str) -> None:
         with self._lock:
-            self.validate(object_id, issuer_raw, GRANT)
+            self.validate(object_id, issuer_raw, "share")
             target = self._tokens.get(_hash_token(target_raw))
             if target is None or target.object_id != object_id:
                 raise AuthenticationError("target token is invalid")
-            if target.permissions == ALL_PERMISSIONS and target_raw == issuer_raw:
+            if target.level == "admin" and target_raw == issuer_raw:
                 raise InvalidRequest("refusing to revoke the token currently authorizing this request")
             target.revoked = True
 
     def delete_object(self, object_id: str, raw_token: str) -> None:
         with self._lock:
-            obj, _ = self.validate(object_id, raw_token, DELETE)
+            obj, _ = self.validate(object_id, raw_token, "admin")
             self._objects.pop(object_id, None)
             for token_hash in [
                 key for key, token in self._tokens.items() if token.object_id == object_id

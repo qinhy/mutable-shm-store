@@ -18,7 +18,7 @@ def test_mutable_zero_copy_views(server):
     a = owner.numpy()
     a.fill(7)
 
-    write_token = owner.issue("write")
+    write_token = owner.issue(level="write")
     writer = store.open(owner.object_id, write_token, mode="write")
     b = writer.numpy()
     b[0, 0] = [10, 20, 30]
@@ -30,7 +30,7 @@ def test_read_token_maps_read_only(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(16,), dtype=np.uint8)
     owner.numpy()[:] = np.arange(16, dtype=np.uint8)
-    read_token = owner.issue("read")
+    read_token = owner.issue(level="read")
 
     reader = store.open(owner.object_id, read_token, mode="read")
     arr = reader.numpy()
@@ -45,7 +45,7 @@ def test_read_token_maps_read_only(server):
 def test_revoke_blocks_future_open_but_existing_mapping_survives(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(8,), dtype=np.uint8)
-    token = owner.issue("write")
+    token = owner.issue(level="write")
     existing = store.open(owner.object_id, token, mode="write")
     arr = existing.numpy()
     arr[0] = 1
@@ -61,7 +61,7 @@ def test_revoke_blocks_future_open_but_existing_mapping_survives(server):
 def test_expiring_token(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(4,), dtype=np.uint8)
-    token = owner.issue("read", expires_in=0.03)
+    token = owner.issue(level="read", expires_in=0.03)
     time.sleep(0.05)
     with pytest.raises(TokenExpired):
         store.open(owner.object_id, token, mode="read")
@@ -70,7 +70,7 @@ def test_expiring_token(server):
 def test_delete_blocks_new_opens_existing_mapping_survives(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(8,), dtype=np.uint8)
-    read_token = owner.issue("read")
+    read_token = owner.issue(level="read")
     existing = store.open(owner.object_id, read_token, mode="read")
     existing_arr = existing.numpy()
     owner.numpy()[0] = 55
@@ -87,7 +87,7 @@ def test_raw_buffer(server):
     owner = store.create(size=128)
     view = owner.buffer()
     view[:4] = b"MSTR"
-    token = owner.issue("read")
+    token = owner.issue(level="read")
     reader = store.open(owner.object_id, token)
     assert bytes(reader.buffer()[:4]) == b"MSTR"
 
@@ -100,7 +100,7 @@ def test_independent_python_process_mutates_same_pages(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(1024,), dtype=np.uint8)
     owner.numpy().fill(3)
-    token = owner.issue("write")
+    token = owner.issue(level="write")
 
     code = r'''
 import sys
@@ -145,7 +145,7 @@ def test_client_serializes_persistent_connection_across_threads(server):
 def test_cached_open_reuses_mapping_without_control_request(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(8,), dtype=np.uint8)
-    read_token = owner.issue("read")
+    read_token = owner.issue(level="read")
 
     first = store.open(owner.object_id, read_token, cache=True)
     state = first._state
@@ -159,7 +159,7 @@ def test_cached_open_reuses_mapping_without_control_request(server):
 def test_cached_mapping_is_an_established_capability_lease(server):
     store = mstore.connect(server.endpoint)
     owner = store.create(shape=(8,), dtype=np.uint8)
-    read_token = owner.issue("read")
+    read_token = owner.issue(level="read")
 
     cached = store.open(owner.object_id, read_token, cache=True)
     state = cached._state
@@ -180,8 +180,8 @@ def test_cache_eviction_waits_for_live_shared_object(server):
     store = mstore.connect(server.endpoint, cache_size=1)
     first_owner = store.create(size=8)
     second_owner = store.create(size=8)
-    first_token = first_owner.issue("read")
-    second_token = second_owner.issue("read")
+    first_token = first_owner.issue(level="read")
+    second_token = second_owner.issue(level="read")
 
     first = store.open(first_owner.object_id, first_token, cache=True)
     first_state = first._state
